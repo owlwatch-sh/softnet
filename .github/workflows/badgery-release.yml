@@ -67,7 +67,7 @@ jobs:
         with:
           name: softnet-unsigned
           path: dist/softnet
-          retention-days: 1
+          retention-days: 7
           if-no-files-found: error
 
   # Only a tag's run signs, in the release environment: its tag rule
