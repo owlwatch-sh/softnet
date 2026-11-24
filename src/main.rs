@@ -1,16 +1,16 @@
 use anyhow::{Context, anyhow};
 use clap::Parser;
+use hickory_server::proto::rr::Name;
 use log::LevelFilter;
-use nix::sys::signal::{SigHandler, Signal, signal};
 use oslog::OsLogger;
-use privdrop::PrivDrop;
 use softnet::NetType;
+use softnet::control::Control;
+use softnet::manager::{Manager, VmConfig};
 use softnet::proxy::ExposedPort;
-use softnet::proxy::Proxy;
 use softnet::proxy::Rule;
 use std::env;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::raw::c_int;
-use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 use system_configuration::core_foundation::base::TCFType;
@@ -23,6 +23,7 @@ use system_configuration::sys::preferences::{
     SCPreferencesApplyChanges, SCPreferencesCommitChanges, SCPreferencesLock,
     SCPreferencesSetValue, SCPreferencesUnlock,
 };
+use tokio::signal::unix::{SignalKind, signal};
 use uzers::{get_current_groupname, get_current_username, get_effective_uid};
 
 const VERSION: &str = match option_env!("SOFTNET_VERSION") {
@@ -36,21 +37,31 @@ struct Args {
     #[clap(
         long,
         value_parser = parse_vm_fd,
+        requires = "vm_mac_address",
+        required_unless_present = "control_fd",
         help = "FD number to use for communicating with the VM's networking stack"
     )]
-    vm_fd: c_int,
+    vm_fd: Option<c_int>,
 
     #[clap(
         long,
         value_parser = parse_vm_fd,
-        help = "connected Unix stream FD for newline-delimited JSON-RPC policy control"
+        help = "connected Unix stream FD for newline-delimited JSON-RPC control"
     )]
     control_fd: Option<c_int>,
 
-    #[clap(long, help = "MAC address to enforce for the VM")]
-    vm_mac_address: mac_address::MacAddress,
+    #[clap(long, requires = "vm_fd", help = "MAC address to enforce for the VM")]
+    vm_mac_address: Option<mac_address::MacAddress>,
 
-    #[clap(long, value_enum, help = "type of network to use for the VM", default_value_t=NetType::Nat)]
+    #[clap(
+        long,
+        requires = "vm_fd",
+        value_parser = |value: &str| Name::from_ascii(value),
+        help = "Single-label VM name to register as <NAME>.internal"
+    )]
+    vm_name: Option<Name>,
+
+    #[clap(long, requires = "vm_fd", value_enum, help = "type of network to use for the VM", default_value_t=NetType::Nat)]
     vm_net_type: NetType,
 
     #[clap(
@@ -68,26 +79,26 @@ struct Args {
 
     #[clap(
         long,
+        requires = "vm_fd",
         help = "Comma-separated rules for allowing traffic, in the following forms:\n\n\
         * TARGET: traffic sent from the VM to TARGET; reverse traffic is not filtered by this rule\n\
-        * in TARGET: flows initiated from TARGET to the VM\n\
-        * out TARGET: flows initiated from the VM to TARGET\n\n\
-        Targets are:\n\n\
-        * IPv4 CIDRs\n\
-        * @host, which matches the vmnet bridge gateway IP\n\n\
-        A target may end in :PORT or :FIRST-LAST to match only TCP and UDP traffic with \
-        that port on the target's side. A rule with ports takes precedence over any rule \
-        without them.\n\n\
+        * in [proto PROTO] [TARGET] [port PORT]: flows initiated toward the VM\n\
+        * out [proto PROTO] [TARGET] [port PORT]: flows initiated by the VM\n\n\
+        Parameters:\n\n\
+        * TARGET: an IPv4 CIDR, @host (the vmnet bridge gateway IP), or @peers \
+        (other configured VMs' reserved IPs on this Softnet network); defaults to 0.0.0.0/0 when omitted\n\
+        * PROTO: tcp, udp, or icmp\n\
+        * PORT: destination port or inclusive START:END range (TCP/UDP only)\n\n\
         Directional rules make bare TARGET rules stateful in both directions.\n\n\
-        When used with --block, the longest prefix match wins. If an identical rule is both \
-        allowed and blocked, blocking takes precedence.\n\n\
-        --allow=0.0.0.0/0 additionally disables bridge isolation, even when \
-        --block=0.0.0.0/0 is specified.\n\n\
+        When used with --block, matching prefers a port, then the longest prefix, then a protocol, \
+        then the narrowest port range. Blocking wins ties.\n\n\
         Examples:\n\n\
         * --allow=192.168.0.0/24 — allow stateless traffic with this LAN\n\
         * --allow=\"in @host\" — allow stateful flows initiated from @host\n\
         * --allow=\"out 192.168.0.0/24\" — allow stateful flows initiated toward this LAN\n\
-        * --allow=192.168.0.10/32:8443 — allow stateless traffic with one port of this LAN host\n\
+        * --allow=\"out @peers\" — allow stateful flows initiated toward other VMs\n\
+        * --allow=\"in proto tcp @host port 22\" — allow SSH from the host to the VM\n\
+        * --allow=\"in proto tcp port 49152:65535\" — allow TCP connections to the VM's dynamic port range\n\
         * --allow=\"in @host,out 192.168.0.0/24\" — multiple rules may be comma-separated",
         value_name = "comma-separated rules",
         use_value_delimiter = true,
@@ -97,24 +108,23 @@ struct Args {
 
     #[clap(
         long,
+        requires = "vm_fd",
         help = "Comma-separated rules for blocking traffic, in the following forms:\n\n\
         * TARGET: traffic sent from the VM to TARGET; reverse traffic is not filtered by this rule\n\
-        * in TARGET: flows initiated from TARGET to the VM\n\
-        * out TARGET: flows initiated from the VM to TARGET\n\n\
-        Targets are:\n\n\
-        * IPv4 CIDRs\n\
-        * @host, which matches the vmnet bridge gateway IP\n\n\
-        A target may end in :PORT or :FIRST-LAST to match only TCP and UDP traffic with \
-        that port on the target's side. A rule with ports takes precedence over any rule \
-        without them.\n\n\
+        * in [proto PROTO] [TARGET] [port PORT]: flows initiated toward the VM\n\
+        * out [proto PROTO] [TARGET] [port PORT]: flows initiated by the VM\n\n\
+        Parameters:\n\n\
+        * TARGET: an IPv4 CIDR, @host (the vmnet bridge gateway IP), or @peers \
+        (other configured VMs' reserved IPs on this Softnet network); defaults to 0.0.0.0/0 when omitted\n\
+        * PROTO: tcp, udp, or icmp\n\
+        * PORT: destination port or inclusive START:END range (TCP/UDP only)\n\n\
         Directional rules make bare TARGET rules stateful in both directions.\n\n\
-        When used with --allow, the longest prefix match wins. If an identical rule is both \
-        allowed and blocked, blocking takes precedence.\n\n\
+        When used with --allow, matching prefers a port, then the longest prefix, then a protocol, \
+        then the narrowest port range. Blocking wins ties.\n\n\
         Examples:\n\n\
         * --block=0.0.0.0/0 — establish a stateless default-deny egress policy\n\
-        * --block=\"out @host\" — block stateful flows initiated toward @host\n\
+        * --block=\"out proto tcp port 22\" — block SSH from the VM to any host\n\
         * --block=\"out 66.66.66.0/24\" — block stateful flows initiated toward this CIDR\n\
-        * --block=@host:22 — block stateless traffic to SSH on @host\n\
         * --block=\"out @host,out 66.66.66.0/24\" — multiple rules may be comma-separated",
         value_name = "comma-separated rules",
         use_value_delimiter = true,
@@ -124,6 +134,7 @@ struct Args {
 
     #[clap(
         long,
+        requires = "vm_fd",
         help = "comma-separated list of TCP ports to expose (e.g. --expose 2222:22,8080:80)",
         value_name = "comma-separated port specifications",
         use_value_delimiter = true,
@@ -176,19 +187,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn try_main() -> anyhow::Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn try_main() -> anyhow::Result<()> {
     // Initialize logger
     OsLogger::new("org.cirruslabs.softnet")
         .level_filter(LevelFilter::Info)
         .init()?;
-
-    // The default signal(3)[1] action for SIGINT is to interrupt program,
-    // but we want to handle SIGINT ourselves, so we ignore it. The kqueue(2)'s[2]
-    // EVFILT_SIGNAL will receive it anyways, because it has lower precedence.
-    //
-    // [1]: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/signal.3.html
-    // [2]: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html
-    unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) }?;
 
     let args: Args = Args::parse();
 
@@ -236,28 +240,58 @@ fn try_main() -> anyhow::Result<()> {
     // Configure bootpd(8) while still having the root privileges
     configure_bootpd(args.bootpd_lease_time)?;
 
-    // Initialize the proxy while still having the root privileges
-    let mut proxy = Proxy::new(
-        args.vm_fd as RawFd,
-        args.vm_mac_address,
-        args.vm_net_type,
-        args.allow,
-        args.block,
-        args.expose,
-        args.control_fd.map(|fd| fd as RawFd),
-    )
-    .context("failed to initialize proxy")?;
+    // Take ownership of the control descriptor inherited from the parent process
+    let control = args
+        .control_fd
+        .map(|control_fd| {
+            // SAFETY: fcntl checks whether the descriptor is open before taking ownership
+            if unsafe { libc::fcntl(control_fd, libc::F_GETFD) } == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("invalid control file descriptor");
+            }
 
-    // Drop effective privileges to the user
-    // and group which have had invoked us
-    PrivDrop::default()
-        .user(args.user.unwrap_or(current_user_name))
-        .group(args.group.unwrap_or(current_group_name))
-        .apply()
-        .context("failed to drop privileges")?;
+            // SAFETY: fcntl verified the descriptor is open, so we transfer the ownership
+            Control::new(unsafe { OwnedFd::from_raw_fd(control_fd) })
+        })
+        .transpose()?;
 
-    // Run proxy
-    proxy.run()
+    // Instantiate the manager with its control connection
+    let mut manager = Manager::new(
+        args.user.unwrap_or(current_user_name),
+        args.group.unwrap_or(current_group_name),
+        control,
+    );
+
+    // Run the manager until it finishes or the process receives SIGINT
+    let mut interrupt = signal(SignalKind::interrupt())?;
+
+    let result = tokio::select! {
+        result = async {
+            if let (Some(vm_fd), Some(vm_mac_address)) = (args.vm_fd, args.vm_mac_address) {
+                // Initialize the legacy single-VM path through the shared manager's batch operation
+                manager
+                    .initialize(
+                        args.vm_net_type,
+                        vec![VmConfig {
+                            vm_fd,
+                            vm_mac_address,
+                            name: args.vm_name,
+                            allow: args.allow,
+                            block: args.block,
+                            exposed_ports: args.expose,
+                        }],
+                    )
+                    .await?;
+            }
+
+            manager.run().await
+        } => result,
+        _ = interrupt.recv() => Ok(()),
+    };
+
+    let shutdown_result = manager.shutdown().await;
+
+    result.and(shutdown_result)
 }
 
 fn parse_vm_fd(value: &str) -> Result<c_int, String> {
