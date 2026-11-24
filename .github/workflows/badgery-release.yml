@@ -18,21 +18,16 @@ permissions:
   contents: read
 
 jobs:
-  release:
+  # The build has no way to the signing credentials: no OIDC token, no
+  # environment. What it builds, a crate's build script included, cannot
+  # reach Doppler; the signing job below takes only its binary.
+  build:
     if: github.repository == 'owlwatch-sh/softnet'
-    name: Release
+    name: Build
     runs-on: macos-26
     timeout-minutes: 60
-    # Only a tag's run signs, in the release environment: its tag rule
-    # (*-owlwatch.*) and reviewer are the gate, and its subject is the one
-    # Doppler's release identity trusts. A push to badgery builds unsigned.
-    environment: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || '' }}
-    permissions:
-      contents: write
-      id-token: write
     env:
       VERSION: ${{ github.ref_name }}
-      RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -65,9 +60,41 @@ jobs:
             cargo build --release --locked --target aarch64-apple-darwin
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/softnet dist/softnet
+          dist/softnet --version
+      - name: Hand the build to the signing job
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: softnet-unsigned
+          path: dist/softnet
+          retention-days: 1
+          if-no-files-found: error
+
+  # Only a tag's run signs, in the release environment: its tag rule
+  # (*-owlwatch.*) and reviewer are the gate, and its subject is the one
+  # Doppler's release identity trusts. It runs nothing it did not write here.
+  release:
+    if: github.repository == 'owlwatch-sh/softnet' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    name: Release
+    runs-on: macos-26
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - name: Take the build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: softnet-unsigned
+          path: dist
+      - name: Make it executable
+        run: chmod 755 dist/softnet
       - name: Read Apple signing credentials from Doppler
         id: doppler
-        if: env.RELEASE == 'true'
         env:
           DOPPLER_IDENTITY: ${{ vars.DOPPLER_IDENTITY }}
           SECRETS: MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID
@@ -101,7 +128,6 @@ jobs:
             printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter" >> "$GITHUB_OUTPUT"
           done
       - name: Import signing certificate
-        if: env.RELEASE == 'true'
         env:
           MACOS_SIGN_P12: ${{ steps.doppler.outputs.MACOS_SIGN_P12 }}
           MACOS_SIGN_PASSWORD: ${{ steps.doppler.outputs.MACOS_SIGN_PASSWORD }}
@@ -125,7 +151,6 @@ jobs:
           security list-keychain -d user -s "$RUNNER_TEMP/build.keychain" $(security list-keychains -d user | tr -d '"')
           rm "$RUNNER_TEMP/certificate.p12"
       - name: Sign and notarize
-        if: env.RELEASE == 'true'
         env:
           MACOS_NOTARY_KEY_ID: ${{ steps.doppler.outputs.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_ISSUER_ID: ${{ steps.doppler.outputs.MACOS_NOTARY_ISSUER_ID }}
@@ -142,7 +167,6 @@ jobs:
             --keychain "$RUNNER_TEMP/build.keychain" \
             dist/softnet
           codesign --verify --strict --verbose=2 dist/softnet
-          dist/softnet --version
 
           # A bare executable cannot be stapled; Gatekeeper finds the ticket online
           ditto -c -k dist/softnet "$RUNNER_TEMP/softnet-notarization.zip"
@@ -157,7 +181,6 @@ jobs:
           shasum -a 256 softnet.tar.gz dist/softnet | tee SHA256SUMS
           codesign --display --requirements - dist/softnet 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Publish
-        if: env.RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -166,7 +189,7 @@ jobs:
             --title "$VERSION" \
             --notes "Owlwatch build of Softnet $VERSION: arm64, signed and notarized by Owlwatch (Bright Shore Technologies). Upstream's source, unchanged."
       - name: Remove signing material
-        if: always() && env.RELEASE == 'true'
+        if: always()
         run: |
           security delete-keychain "$RUNNER_TEMP/build.keychain" || true
           rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/certificate.p12"
