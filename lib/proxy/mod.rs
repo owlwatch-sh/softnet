@@ -1,4 +1,3 @@
-mod control;
 mod exposed_port;
 mod flows;
 mod host;
@@ -7,242 +6,276 @@ mod rules;
 mod vm;
 
 use crate::dhcp_server::{DHCP_SERVER_MAC, DhcpServer};
+use crate::dns_server::DnsServer;
 use crate::host::Host;
-use crate::host::NetType;
-use crate::poller::Poller;
+use crate::network::Network;
 use crate::vm::VM;
-use anyhow::{Context, Result, bail};
-use control::{Control, normalize_rules};
+use crate::wireguard::{Config, Status, WireGuard};
+use anyhow::Result;
 pub use exposed_port::ExposedPort;
 use flows::{FlowTable, PendingFlow};
-use ipnet::Ipv4Net;
+use futures_util::future::OptionFuture;
 use mac_address::MacAddress;
-pub use rule::{Direction, Ports, Rule, Target};
+pub use rule::{Direction, Filter, PortRange, Protocol, Rule, Target};
 pub(crate) use rules::{PolicyDecision, Rules};
-use smoltcp::wire::{EthernetAddress, EthernetFrame, IpProtocol, Ipv4Address, Ipv4Packet};
-use std::io::ErrorKind;
-use std::os::unix::io::{AsRawFd, RawFd};
+use smoltcp::wire::{
+    ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, Ipv4Packet,
+};
+use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{MissedTickBehavior, interval};
 use vmnet::Batch;
 
-pub struct Proxy<'proxy> {
+pub(crate) enum Command {
+    PolicyGet {
+        reply: oneshot::Sender<Policy>,
+    },
+    PolicySet {
+        allow: Vec<Rule>,
+        block: Vec<Rule>,
+        reply: oneshot::Sender<Policy>,
+    },
+    SetWireGuard {
+        params: Config,
+        reply: oneshot::Sender<Result<Status>>,
+    },
+    ClearWireGuard {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Policy {
+    pub(crate) allow: Vec<Rule>,
+    pub(crate) block: Vec<Rule>,
+    pub(crate) rule_count: usize,
+}
+
+pub struct Proxy {
     vm: VM,
     host: Host,
-    poller: Poller<'proxy>,
     vm_mac_address: smoltcp::wire::EthernetAddress,
+    peer_ips: Vec<Ipv4Addr>,
     dhcp_server: DhcpServer,
+    dns_server: Option<Arc<DnsServer>>,
+    wireguard: Option<WireGuard>,
+    subnet: ipnet::Ipv4Net,
     rules: Rules,
-    control: Option<Control>,
+    allow: Vec<Rule>,
+    block: Vec<Rule>,
     flows: Option<FlowTable>,
     enobufs_encountered: bool,
 }
 
-impl Proxy<'_> {
-    pub fn new<'proxy>(
-        vm_fd: RawFd,
+impl Proxy {
+    /// Creates the VM interface and packet policy using the entered Tokio runtime.
+    pub(crate) fn new(
+        vm: VM,
         vm_mac_address: MacAddress,
-        vm_net_type: NetType,
+        vm_ip: Ipv4Addr,
+        network: &Network,
         allow: Vec<Rule>,
         block: Vec<Rule>,
-        exposed_ports: Vec<ExposedPort>,
-        control_fd: Option<RawFd>,
-    ) -> Result<Proxy<'proxy>> {
-        // Ensure that VM's MAC address won't conflict with our DHCP server's MAC address
+        dns_server: Option<Arc<DnsServer>>,
+    ) -> Result<Proxy> {
         let vm_mac_address = EthernetAddress(vm_mac_address.bytes());
-        if vm_mac_address == DHCP_SERVER_MAC {
-            bail!("VM MAC address {vm_mac_address} is reserved for the DHCP server");
-        }
-
         let allow = normalize_rules(allow);
         let block = normalize_rules(block);
 
-        let vm = VM::new(vm_fd)?;
-        let mut host = Host::new(
-            vm_net_type,
-            vm_mac_address,
-            !allow.contains(&Rule::Stateless(Target::Prefix(Ipv4Net::default()), None)),
-        )?;
-        let poller_timeout = Duration::from_millis(100);
-        let control = control_fd
-            .map(|control_fd| {
-                Control::new(control_fd, host.gateway_ip, allow.clone(), block.clone())
-            })
-            .transpose()?;
-        let poller = Poller::new(
-            vm.as_raw_fd(),
-            host.as_raw_fd(),
-            control.as_ref().map(AsRawFd::as_raw_fd),
-            poller_timeout,
-        )?;
+        // Create this VM's vmnet interface on the shared network
+        let host = Host::new(network, vm_ip)?;
 
-        let rules = Rules::new(host.gateway_ip, &allow, &block);
+        // Keep the other VMs' reservations for initial and replacement policies
+        let peer_ips: Vec<_> = network
+            .vm_ips
+            .iter()
+            .copied()
+            .filter(|peer_ip| *peer_ip != vm_ip)
+            .collect();
+        let rules = Rules::new(host.gateway_ip, &peer_ips, &allow, &block);
 
         // Any stateful rule enables flow inspection for the whole VM, including
         // traffic admitted through implicit global and gateway fallbacks
         let flows = rules.has_stateful().then(FlowTable::new);
 
-        // vmnet owns the gateway (including ARP and DNS); the VM address is
-        // reserved for this MAC for the lifetime of the attached interface.
+        // Serve the VM's reserved address over DHCP
         let dhcp_server = DhcpServer::new(
             vm_mac_address,
             host.vm_ip,
-            host.subnet_mask,
+            network.subnet.netmask(),
             host.gateway_ip,
+            dns_server.iter().map(|server| server.domain()).collect(),
         );
-
-        // Install port forwardings for the reserved VM's IP address
-        for port in exposed_ports {
-            host.port_forwarding_add_rule(port.external_port, host.vm_ip, port.internal_port)
-                .context("failed to configure port forwarding")?;
-        }
 
         Ok(Proxy {
             vm,
             host,
-            poller,
             vm_mac_address,
+            peer_ips,
             dhcp_server,
+            dns_server,
+            wireguard: None,
+            subnet: network.subnet,
             rules,
-            control,
+            allow,
+            block,
             flows,
             enobufs_encountered: false,
         })
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub(crate) async fn run(&mut self, mut commands_rx: mpsc::Receiver<Command>) -> Result<()> {
+        let max_packet_size = self.host.max_packet_size as usize;
+        let vm_ip = self.host.vm_ip;
+
         // Create a single buffer from reading from the VM
-        let mut buf: Vec<u8> = vec![0; self.host.max_packet_size as usize];
+        let mut buf: Vec<u8> = vec![0; max_packet_size];
 
         // Create multiple buffers and a batch for reading from the host
-        let mut bufs = vec![
-            vec![0u8; self.host.max_packet_size as usize];
-            self.host.read_max_packets as usize
-        ];
+        let mut bufs = vec![vec![0u8; max_packet_size]; self.host.read_max_packets as usize];
         let mut batch = Batch::preallocate(bufs.len());
 
-        self.poller.arm()?;
+        // Check VM connectivity periodically, skipping missed ticks
+        let mut maintenance = interval(Duration::from_millis(100));
+        maintenance.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+        // Reserve space for the Ethernet header before the WireGuard IPv4 payload
+        let mut wireguard_buf = vec![0; max_packet_size];
+
+        // Service packet I/O, policy changes, and maintenance on the same runtime
         loop {
-            let (vm_readable, host_readable, interrupt) = self.poller.wait()?;
+            tokio::select! {
+                result = self.vm.read(&mut buf) => {
+                    let n = match result {
+                        Ok(n) => n,
+                        Err(error) => {
+                            // Treat peer closure as normal VM shutdown
+                            if self.vm.is_disconnect(&error)? {
+                                return Ok(());
+                            }
 
-            // Update coarse time for flows
-            coarsetime::Instant::update();
+                            return Err(error.into());
+                        }
+                    };
 
-            // Service control on every wake (including timeouts) so a bounded read or a pending
-            // response continues making progress even when no new edge is generated.
-            self.service_control();
-
-            if vm_readable {
-                self.read_from_vm(buf.as_mut_slice())?;
-            }
-
-            if host_readable {
-                self.read_from_host(&mut batch, &mut bufs)?;
-            }
-
-            // Graceful termination
-            if interrupt {
-                return Ok(());
-            }
-
-            // Periodic maintenance
-            if self.poller.periodic_tick_due() {
-                // kqueue(2) does not report peer disconnects for Unix datagram sockets
-                if !self.vm.is_connected()? {
-                    return Ok(());
-                }
-            }
-
-            self.poller.rearm();
-        }
-    }
-
-    fn read_from_vm(&mut self, buf: &mut [u8]) -> Result<()> {
-        let mut packets_read = 0;
-
-        loop {
-            match self.vm.read(buf) {
-                Ok(n) => {
-                    // Update coarse time for flows
+                    // Update the coarse time once the packet arrives
                     coarsetime::Instant::update();
 
                     if let Ok(frame) = EthernetFrame::new_checked(&buf[..n]) {
-                        self.process_frame_from_vm(frame)?;
+                        self.process_frame_from_vm(frame).await?;
                     }
 
-                    packets_read += 1;
-                    if packets_read == 128 {
-                        self.service_control();
-                        packets_read = 0;
-                    }
-                }
-                Err(err) => {
-                    if err.kind() == ErrorKind::WouldBlock {
-                        return Ok(());
-                    }
+                    // Limit VM bursts to 128 packets (including the one we read above),
+                    // so that other select branches will have a chance to run
+                    for _ in 0..127 {
+                        match self.vm.try_read(&mut buf) {
+                            Ok(n) => {
+                                coarsetime::Instant::update();
 
-                    return Err(err.into());
-                }
-            }
-        }
-    }
+                                if let Ok(frame) = EthernetFrame::new_checked(&buf[..n]) {
+                                    self.process_frame_from_vm(frame).await?;
+                                }
 
-    fn read_from_host(&mut self, batch: &mut Batch, bufs: &mut [Vec<u8>]) -> Result<()> {
-        loop {
-            match self.host.read(batch, bufs) {
-                Ok(pktcnt) => {
-                    // Update coarse time for flows
-                    coarsetime::Instant::update();
+                                tokio::task::consume_budget().await;
+                            }
+                            Err(err) => {
+                                // End this burst once all queued packets have been drained
+                                if err.kind() == std::io::ErrorKind::WouldBlock {
+                                    break;
+                                }
 
-                    for buf in batch.packet_sized_bufs(bufs).take(pktcnt) {
-                        if let Ok(pkt) = EthernetFrame::new_checked(buf) {
-                            self.process_frame_from_host(&pkt)?;
+                                // Treat peer closure as normal VM shutdown
+                                if self.vm.is_disconnect(&err)? {
+                                    return Ok(());
+                                }
+
+                                return Err(err.into());
+                            }
                         }
                     }
-
-                    self.service_control();
                 }
-                Err(err) => {
-                    if let vmnet::Error::VmnetReadNothing = err {
+
+                result = self.host.read(&mut batch, &mut bufs) => {
+                    let pktcnt = result?;
+
+                    // Update the coarse time once the packet arrives
+                    coarsetime::Instant::update();
+
+                    for buf in batch.packet_sized_bufs(&bufs).take(pktcnt) {
+                        if let Ok(pkt) = EthernetFrame::new_checked(buf)
+                            && let Err(error) = self.process_frame_from_host(&pkt) {
+                                // Treat peer closure as normal VM shutdown
+                                if let Some(io_error) = error.downcast_ref::<std::io::Error>()
+                                    && self.vm.is_disconnect(io_error)?
+                                {
+                                    return Ok(());
+                                }
+
+                                return Err(error);
+                            }
+
+                        tokio::task::consume_budget().await;
+                    }
+                }
+
+                command = commands_rx.recv() => {
+                    match command {
+                        Some(Command::PolicyGet { reply }) => {
+                            let _ = reply.send(self.policy_get());
+                        }
+                        Some(Command::PolicySet { allow, block, reply }) => {
+                            let _ = reply.send(self.policy_set(allow, block));
+                        }
+                        Some(Command::SetWireGuard { params, reply }) => {
+                            let _ = reply.send(self.wireguard_set(params).await);
+                        }
+                        Some(Command::ClearWireGuard { reply }) => {
+                            self.wireguard = None;
+                            let _ = reply.send(());
+                        }
+                        None => return Ok(()),
+                    }
+                }
+
+                Some(result) = OptionFuture::from(self.wireguard.as_mut().map(|wireguard| {
+                    wireguard.receive_vm_ipv4(&mut wireguard_buf[ETHERNET_HEADER_LEN..], vm_ip)
+                })) => {
+                    let Some(length) = result? else {
+                        // Return to select after dropping a tunnel packet
+                        continue;
+                    };
+
+                    // Update the coarse time once the packet arrives
+                    coarsetime::Instant::update();
+
+                    // Rebuild the Ethernet frame for delivery to the VM
+                    let frame = &mut wireguard_buf[..ETHERNET_HEADER_LEN + length];
+                    let mut ethernet = EthernetFrame::new_unchecked(&mut frame[..]);
+                    ethernet.set_ethertype(EthernetProtocol::Ipv4);
+                    ethernet.set_src_addr(DHCP_SERVER_MAC);
+                    ethernet.set_dst_addr(self.vm_mac_address);
+
+                    if let Err(error) = self.write_to_vm(frame) {
+                        // Treat peer closure as normal VM shutdown
+                        if let Some(io_error) = error.downcast_ref::<std::io::Error>()
+                            && self.vm.is_disconnect(io_error)?
+                        {
+                            return Ok(());
+                        }
+
+                        return Err(error);
+                    }
+                }
+
+                _ = maintenance.tick() => {
+                    // Unix datagram sockets do not report peer closure as readable
+                    if !self.vm.is_connected()? {
                         return Ok(());
                     }
-
-                    return Err(err.into());
                 }
             }
-        }
-    }
-
-    fn service_control(&mut self) {
-        let Some(control) = self.control.as_mut() else {
-            return;
-        };
-
-        let keep_open = match control.service(&mut self.rules) {
-            Ok(keep_open) => keep_open,
-            Err(err) => {
-                log::warn!("disabling Softnet control socket: {err:#}");
-                false
-            }
-        };
-
-        // Invalidate tracked flows whenever the policy changes
-        if control.policy_changed() {
-            self.flows = self.rules.has_stateful().then(FlowTable::new);
-        }
-
-        if keep_open {
-            return;
-        }
-
-        if let Err(err) = self.poller.remove_control() {
-            log::warn!("failed to remove Softnet control socket from the poller: {err:#}");
-        }
-
-        if let Some(control) = self.control.take()
-            && let Err(err) = control.shutdown()
-        {
-            log::warn!("failed to shut down Softnet control socket: {err:#}");
         }
     }
 
@@ -263,94 +296,146 @@ impl Proxy<'_> {
     fn admit_with_tracking_if_stateful(
         &mut self,
         pending: Option<PendingFlow>,
-        peer_addr: Ipv4Address,
-        peer_port: Option<u16>,
+        ipv4_pkt: &Ipv4Packet<&[u8]>,
         return_direction: Direction,
     ) -> Option<()> {
-        if self
-            .rules
-            .is_stateful(peer_addr, peer_port, return_direction)
-        {
+        if self.rules.is_stateful(ipv4_pkt, return_direction) {
             self.admit_with_tracking_if_trackable(pending)
         } else {
             Some(())
         }
     }
+
+    pub(crate) fn policy_get(&self) -> Policy {
+        Policy {
+            allow: self.allow.clone(),
+            block: self.block.clone(),
+            rule_count: self.rules.len(),
+        }
+    }
+
+    pub(crate) fn policy_set(&mut self, allow: Vec<Rule>, block: Vec<Rule>) -> Policy {
+        let allow = normalize_rules(allow);
+        let block = normalize_rules(block);
+
+        // Keep existing tracked flows when the normalized policy is unchanged
+        if self.allow != allow || self.block != block {
+            self.rules = Rules::new(self.host.gateway_ip, &self.peer_ips, &allow, &block);
+            self.allow = allow;
+            self.block = block;
+            self.flows = self.rules.has_stateful().then(FlowTable::new);
+        }
+
+        self.policy_get()
+    }
+
+    async fn wireguard_set(&mut self, config: Config) -> Result<Status> {
+        config.validate(self.subnet)?;
+
+        let wireguard = match &mut self.wireguard {
+            Some(wireguard) => {
+                wireguard.apply(config)?;
+                wireguard
+            }
+            slot @ None => slot.insert(WireGuard::new(config).await?),
+        };
+
+        Ok(wireguard.status())
+    }
+
+    pub(crate) fn finalize(&mut self) -> Result<()> {
+        self.host.finalize()
+    }
 }
 
-/// Returns the TCP or UDP source and destination ports, which only the first fragment carries.
-pub(crate) fn transport_ports(ipv4_pkt: &Ipv4Packet<&[u8]>) -> Option<(u16, u16)> {
-    if !matches!(ipv4_pkt.next_header(), IpProtocol::Tcp | IpProtocol::Udp)
-        || ipv4_pkt.frag_offset() != 0
-    {
-        return None;
-    }
+fn normalize_rules(mut rules: Vec<Rule>) -> Vec<Rule> {
+    rules.iter_mut().for_each(|rule| *rule = rule.normalized());
+    rules.sort_by_key(ToString::to_string);
+    rules.dedup();
 
-    // TCP and UDP both begin with the source port, then the destination port
-    match ipv4_pkt.payload() {
-        [src_hi, src_lo, dst_hi, dst_lo, ..] => Some((
-            u16::from_be_bytes([*src_hi, *src_lo]),
-            u16::from_be_bytes([*dst_hi, *dst_lo]),
-        )),
-        _ => None,
-    }
+    rules
 }
 
 #[cfg(test)]
 mod tests {
     use crate::NetType;
-    use crate::proxy::{Proxy, transport_ports};
+    use crate::proxy::{Policy, Proxy};
+    use crate::vm::VM;
     use mac_address::MacAddress;
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use serial_test::serial;
-    use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, UdpPacket};
-    use std::os::fd::AsRawFd;
+    use smoltcp::wire::{EthernetAddress, IpProtocol, Ipv4Address, Ipv4Packet, UdpPacket};
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::str::FromStr;
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_blocking_takes_precedence() {
-        let mut proxy = create_proxy(vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
+    async fn test_blocking_takes_precedence() {
+        let (mut proxy, _peer) = create_proxy(vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
         let vm_ip = proxy.host.vm_ip;
 
         assert_eq!(proxy.rules.len(), 1);
 
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "66.66.66.66").is_none());
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "66.66.66.66")
+                .await
+                .is_none()
+        );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_longest_prefix_match_wins() {
-        let mut proxy = create_proxy(vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
+    async fn test_longest_prefix_match_wins() {
+        let (mut proxy, _peer) = create_proxy(vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
         let vm_ip = proxy.host.vm_ip;
 
         assert_eq!(proxy.rules.len(), 2);
 
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.32").is_none());
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.33").is_some());
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.34").is_none());
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.32")
+                .await
+                .is_none()
+        );
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.33")
+                .await
+                .is_some()
+        );
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.34")
+                .await
+                .is_none()
+        );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_allow_host() {
-        let mut proxy = create_proxy(vec!["@host"], vec!["0.0.0.0/0"]);
+    async fn test_allow_host() {
+        let (mut proxy, _peer) = create_proxy(vec!["@host"], vec!["0.0.0.0/0"]);
         let vm_ip = proxy.host.vm_ip;
 
         assert_eq!(proxy.rules.len(), 2);
 
         // Access to global IPs should be disallowed because of --block=0.0.0.0/0
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "8.8.8.8").is_none());
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "8.8.8.8")
+                .await
+                .is_none()
+        );
 
         // Despite the above, access to host IP address should be possible because of --allow=@host
         let gateway_ip = proxy.host.gateway_ip.to_string();
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, &gateway_ip).is_some());
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, &gateway_ip)
+                .await
+                .is_some()
+        );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_bare_default_block_applies_in_both_directions_in_stateful_mode() {
-        let mut proxy = create_proxy(vec!["in 192.0.2.0/24"], vec!["0.0.0.0/0"]);
+    async fn test_bare_default_block_applies_in_both_directions_in_stateful_mode() {
+        let (mut proxy, _peer) = create_proxy(vec!["in 192.0.2.0/24"], vec!["0.0.0.0/0"]);
         let vm_ip = proxy.host.vm_ip;
         let fallback_peer = Ipv4Address::new(203, 0, 113, 1);
         let explicitly_allowed_peer = Ipv4Address::new(192, 0, 2, 1);
@@ -361,7 +446,12 @@ mod tests {
 
         let fallback_reply = udp_packet(vm_ip, 1_234, fallback_peer, 40_000);
         let fallback_reply = Ipv4Packet::new_checked(fallback_reply.as_slice()).unwrap();
-        assert!(proxy.allowed_from_vm_ipv4(fallback_reply).is_none());
+        assert!(
+            proxy
+                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, fallback_reply)
+                .await
+                .is_none()
+        );
 
         let allowed_request = udp_packet(explicitly_allowed_peer, 40_000, vm_ip, 1_234);
         let allowed_request = Ipv4Packet::new_checked(allowed_request.as_slice()).unwrap();
@@ -369,80 +459,139 @@ mod tests {
 
         let allowed_reply = udp_packet(vm_ip, 1_234, explicitly_allowed_peer, 40_000);
         let allowed_reply = Ipv4Packet::new_checked(allowed_reply.as_slice()).unwrap();
-        assert!(proxy.allowed_from_vm_ipv4(allowed_reply).is_some());
+        assert!(
+            proxy
+                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, allowed_reply)
+                .await
+                .is_some()
+        );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_directional_egress_block_does_not_block_reply_to_unmatched_inbound_flow() {
-        let mut proxy = create_proxy(vec![], vec!["out 203.0.113.0/24"]);
-        let vm_ip = proxy.host.vm_ip;
-        let peer = Ipv4Address::new(203, 0, 113, 1);
+    async fn inbound_replies_preserve_directional_rules_and_private_egress_defaults() {
+        for (block, reply_allowed) in [
+            ("out 10.0.0.0/8", true),
+            ("out proto udp 10.0.0.0/8 port 40000", true),
+            ("out proto udp 10.0.0.0/8 port 53", false),
+            ("out proto tcp 10.0.0.0/8", false),
+        ] {
+            let (mut proxy, _peer) = create_proxy(vec![], vec![block]);
+            let vm_ip = proxy.host.vm_ip;
+            let peer = Ipv4Address::new(10, 1, 2, 3);
+            let reply = udp_packet(vm_ip, 1_234, peer, 40_000);
 
-        let request = udp_packet(peer, 40_000, vm_ip, 1_234);
-        let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
-        assert!(proxy.allowed_from_host_ipv4(&request).is_some());
+            assert!(
+                !allows_vm_packet(&mut proxy, &reply).await,
+                "{block}: unsolicited outbound traffic must be blocked"
+            );
 
-        let reply = udp_packet(vm_ip, 1_234, peer, 40_000);
-        let reply = Ipv4Packet::new_checked(reply.as_slice()).unwrap();
-        assert!(proxy.allowed_from_vm_ipv4(reply).is_some());
+            // Default-admitted inbound traffic keeps private egress restrictions unless tracked
+            let request = udp_packet(peer, 40_000, vm_ip, 1_234);
+            let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
+
+            assert!(
+                proxy.allowed_from_host_ipv4(&request).is_some(),
+                "{block}: inbound request must be admitted"
+            );
+            assert_eq!(
+                allows_vm_packet(&mut proxy, &reply).await,
+                reply_allowed,
+                "{block}: reply policy"
+            );
+
+            let unrelated = udp_packet(vm_ip, 1_235, peer, 40_000);
+
+            assert!(
+                !allows_vm_packet(&mut proxy, &unrelated).await,
+                "{block}: unrelated outbound traffic must remain blocked"
+            );
+        }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_directional_ingress_block_does_not_block_reply_to_bare_outbound_allow() {
-        let mut proxy = create_proxy(vec!["203.0.113.0/24"], vec!["in 203.0.113.0/24"]);
+    async fn test_directional_ingress_block_does_not_block_reply_to_bare_outbound_allow() {
+        let (mut proxy, _peer) = create_proxy(vec!["203.0.113.0/24"], vec!["in 203.0.113.0/24"]);
         let vm_ip = proxy.host.vm_ip;
         let peer = Ipv4Address::new(203, 0, 113, 1);
 
         let request = udp_packet(vm_ip, 1_234, peer, 40_000);
         let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
-        assert!(proxy.allowed_from_vm_ipv4(request).is_some());
+        assert!(
+            proxy
+                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, request)
+                .await
+                .is_some()
+        );
 
         let reply = udp_packet(peer, 40_000, vm_ip, 1_234);
         let reply = Ipv4Packet::new_checked(reply.as_slice()).unwrap();
         assert!(proxy.allowed_from_host_ipv4(&reply).is_some());
     }
 
-    #[test]
-    fn test_transport_ports_only_in_first_fragment() {
-        let src = Ipv4Address::new(10, 0, 0, 2);
-        let dst = Ipv4Address::new(192, 168, 3, 189);
-        let mut bytes = udp_packet(src, 50000, dst, 8444);
-
-        assert_eq!(
-            transport_ports(&Ipv4Packet::new_unchecked(bytes.as_slice())),
-            Some((50000, 8444))
+    #[tokio::test]
+    #[serial]
+    async fn policy_replacement_normalizes_rules_and_preserves_flows_on_retry() {
+        let (mut proxy, _peer) = create_proxy(
+            vec!["out 10.1.2.3/8", "out 10.0.0.0/8"],
+            vec!["in 0.0.0.0/0"],
+        );
+        let vm_ip = proxy.host.vm_ip;
+        let peer = Ipv4Address::new(10, 1, 2, 3);
+        let request = udp_packet(vm_ip, 40_000, peer, 1_234);
+        let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
+        assert!(
+            proxy
+                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, request)
+                .await
+                .is_some()
         );
 
-        Ipv4Packet::new_unchecked(bytes.as_mut_slice()).set_frag_offset(8);
+        // An equivalent policy must preserve the tracked permission for this reply
+        let policy = proxy.policy_set(
+            vec!["out 10.0.0.0/8".parse().unwrap()],
+            vec!["in 0.0.0.0/0".parse().unwrap()],
+        );
         assert_eq!(
-            transport_ports(&Ipv4Packet::new_unchecked(bytes.as_slice())),
-            None
+            policy,
+            Policy {
+                allow: vec!["out 10.0.0.0/8".parse().unwrap()],
+                block: vec!["in 0.0.0.0/0".parse().unwrap()],
+                rule_count: 2,
+            }
         );
 
-        let mut bytes = udp_packet(src, 50000, dst, 8444);
-        Ipv4Packet::new_unchecked(bytes.as_mut_slice()).set_next_header(IpProtocol::Icmp);
-        assert_eq!(
-            transport_ports(&Ipv4Packet::new_unchecked(bytes.as_slice())),
-            None
+        let reply = udp_packet(peer, 1_234, vm_ip, 40_000);
+        let reply = Ipv4Packet::new_checked(reply.as_slice()).unwrap();
+        assert!(proxy.allowed_from_host_ipv4(&reply).is_some());
+
+        // A changed policy clears tracked flows, so the inbound block applies again
+        proxy.policy_set(
+            vec!["out 10.1.0.0/16".parse().unwrap()],
+            vec!["in 0.0.0.0/0".parse().unwrap()],
         );
+        assert!(proxy.allowed_from_host_ipv4(&reply).is_none());
     }
 
-    fn create_proxy<'test>(allow: Vec<&str>, block: Vec<&str>) -> Proxy<'test> {
-        let (vm_fd, _) = socketpair(
+    fn create_proxy(allow: Vec<&str>, block: Vec<&str>) -> (Proxy, OwnedFd) {
+        let (vm_fd, peer) = socketpair(
             AddressFamily::Unix,
             SockType::Datagram,
             None,
             SockFlag::empty(),
         )
         .unwrap();
-        let vm_fd = Box::leak(Box::new(vm_fd));
-
-        Proxy::new(
-            vm_fd.as_raw_fd(),
-            MacAddress::from_str("02:00:00:00:00:02").unwrap(),
-            NetType::Nat,
+        let (_, vm_ip, subnet) = crate::subnet_finder::find_available_subnet(29).unwrap();
+        let vm_mac_address = MacAddress::from_str("02:00:00:00:00:02").unwrap();
+        let network =
+            crate::network::Network::new(NetType::Nat, subnet, &[(vm_mac_address, vm_ip)], &[])
+                .unwrap();
+        let proxy = Proxy::new(
+            VM::new(vm_fd.as_raw_fd()).unwrap(),
+            vm_mac_address,
+            vm_ip,
+            &network,
             allow
                 .into_iter()
                 .map(|value| value.parse().unwrap())
@@ -451,13 +600,23 @@ mod tests {
                 .into_iter()
                 .map(|value| value.parse().unwrap())
                 .collect(),
-            Vec::default(),
             None,
         )
-        .unwrap()
+        .unwrap();
+
+        (proxy, peer)
     }
 
-    fn allowed_from_vm_ipv4(proxy: &mut Proxy, src: Ipv4Address, dst: &str) -> Option<()> {
+    async fn allows_vm_packet(proxy: &mut Proxy, bytes: &[u8]) -> bool {
+        let packet = Ipv4Packet::new_checked(bytes).unwrap();
+
+        proxy
+            .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, packet)
+            .await
+            .is_some()
+    }
+
+    async fn allowed_from_vm_ipv4(proxy: &mut Proxy, src: Ipv4Address, dst: &str) -> Option<()> {
         let mut buf = vec![0; 1500];
 
         let mut ipv4_pkt_mut = Ipv4Packet::new_unchecked(&mut buf[..]);
@@ -466,7 +625,9 @@ mod tests {
 
         let ipv4_pkt = Ipv4Packet::new_unchecked(buf.as_slice());
 
-        proxy.allowed_from_vm_ipv4(ipv4_pkt)
+        proxy
+            .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, ipv4_pkt)
+            .await
     }
 
     fn udp_packet(
@@ -489,5 +650,76 @@ mod tests {
         udp.set_dst_port(dst_port);
         udp.set_len(8);
         bytes
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reserved_wireguard_addresses_cannot_use_vmnet_in_either_direction() {
+        use crate::wireguard::Config;
+        use etherparse::PacketBuilder;
+        use smoltcp::wire::EthernetFrame;
+        use std::os::unix::net::UnixDatagram;
+
+        let (mut proxy, peer) = create_proxy(vec!["0.0.0.0/0"], vec![]);
+        let guest = UnixDatagram::from(peer);
+        guest.set_nonblocking(true).unwrap();
+        let overlay = Ipv4Address::new(198, 18, 1, 2);
+        let remote = Ipv4Address::new(198, 18, 0, 2);
+        let route = "198.18.0.2/32";
+        proxy
+            .wireguard_set(Config::new(overlay, route, None).unwrap())
+            .await
+            .unwrap();
+
+        // Reject a local overlay address that collides with the vmnet gateway
+        let gateway = proxy.host.gateway_ip;
+        let error = proxy
+            .wireguard_set(Config::new(gateway, route, None).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "WireGuard address {gateway} belongs to VM subnet {}",
+                proxy.subnet
+            )
+        );
+
+        let local = proxy.host.vm_ip;
+
+        // Keep both addresses out of vmnet even under a permissive egress policy
+        for destination in [remote, overlay] {
+            let outbound = udp_packet(local, 50_000, destination, 8080);
+            assert!(!allows_vm_packet(&mut proxy, &outbound).await);
+        }
+
+        // Non-tunnel destinations still follow ordinary policy and require the VM source address
+        let ordinary = Ipv4Address::new(203, 0, 113, 2);
+        let outbound = udp_packet(local, 50_000, ordinary, 8080);
+        assert!(allows_vm_packet(&mut proxy, &outbound).await);
+        let spoofed = udp_packet(remote, 50_000, ordinary, 8080);
+        assert!(!allows_vm_packet(&mut proxy, &spoofed).await);
+        proxy.policy_set(vec![], vec!["0.0.0.0/0".parse().unwrap()]);
+        assert!(!allows_vm_packet(&mut proxy, &outbound).await);
+
+        // Ordinary inbound frames cannot impersonate a source reserved for authenticated traffic
+        for source in [remote, overlay] {
+            let mut inbound = Vec::new();
+            PacketBuilder::ethernet2(
+                crate::dhcp_server::DHCP_SERVER_MAC.0,
+                proxy.vm_mac_address.0,
+            )
+            .ipv4(source.octets(), local.octets(), 64)
+            .udp(8080, 50000)
+            .write(&mut inbound, b"spoofed source")
+            .unwrap();
+            proxy
+                .process_frame_from_host(&EthernetFrame::new_checked(inbound.as_slice()).unwrap())
+                .unwrap();
+            assert_eq!(
+                guest.recv(&mut [0; 1500]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
     }
 }

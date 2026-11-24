@@ -1,6 +1,6 @@
-name: Badgery Release
+name: Owlwatch Release
 
-# Badgery's builds of this fork: arm64 only, signed with Badgery's Developer ID
+# Owlwatch's builds of this fork: arm64 only, signed with Owlwatch's Developer ID
 # and notarized, rather than ad-hoc signed
 #
 # A tag builds, signs and publishes a release. A push to the default branch only
@@ -12,14 +12,14 @@ on:
     branches:
       - badgery
     tags:
-      - "*-badgery.*"
+      - "*-owlwatch.*"
 
 permissions:
   contents: read
 
 jobs:
   release:
-    if: github.repository == 'badgery/softnet'
+    if: github.repository == 'owlwatch-sh/softnet'
     name: Release
     runs-on: macos-26
     timeout-minutes: 60
@@ -124,7 +124,7 @@ jobs:
           gh release create "$VERSION" softnet.tar.gz SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --title "$VERSION" \
-            --notes "Badgery build of Softnet $VERSION: arm64, signed and notarized by Badgery, adds TARGET:PORT[-PORT] rules."
+            --notes "Owlwatch build of Softnet $VERSION: arm64, signed and notarized by Owlwatch (Bright Shore Technologies). Upstream's source, unchanged."
       - name: Remove signing material
         if: always() && env.RELEASE == 'true'
         run: |
