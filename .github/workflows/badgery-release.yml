@@ -18,16 +18,16 @@ permissions:
   contents: read
 
 jobs:
-  release:
+  # The build has no way to the signing credentials: no OIDC token, no
+  # environment. What it builds, a crate's build script included, cannot
+  # reach Doppler; the signing job below takes only its binary.
+  build:
     if: github.repository == 'owlwatch-sh/softnet'
-    name: Release
+    name: Build
     runs-on: macos-26
     timeout-minutes: 60
-    permissions:
-      contents: write
     env:
       VERSION: ${{ github.ref_name }}
-      RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -60,12 +60,78 @@ jobs:
             cargo build --release --locked --target aarch64-apple-darwin
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/softnet dist/softnet
-      - name: Import signing certificate
-        if: env.RELEASE == 'true'
+          dist/softnet --version
+      - name: Hand the build to the signing job
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: softnet-unsigned
+          path: dist/softnet
+          retention-days: 7
+          if-no-files-found: error
+
+  # Only a tag's run signs, in the release environment: its tag rule
+  # (*-owlwatch.*) and reviewer are the gate, and its subject is the one
+  # Doppler's release identity trusts. It runs nothing it did not write here.
+  release:
+    if: github.repository == 'owlwatch-sh/softnet' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    name: Release
+    runs-on: macos-26
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - name: Take the build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: softnet-unsigned
+          path: dist
+      - name: Make it executable
+        run: chmod 755 dist/softnet
+      - name: Read Apple signing credentials from Doppler
+        id: doppler
         env:
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          DOPPLER_IDENTITY: ${{ vars.DOPPLER_IDENTITY }}
+          SECRETS: MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID
+        run: |
+          # Signs in to Doppler by OIDC, as owlwatch-sh/owlwatch's release jobs do
+          # (its docs/doppler.md): this job's ID token, issued in the release
+          # environment, for a short-lived token that reads the release config.
+          # Every value is masked before anything is written; nothing is printed.
+          set -euo pipefail
+          if ! [[ "$DOPPLER_IDENTITY" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::set DOPPLER_IDENTITY in this repository's release environment"
+            exit 1
+          fi
+          id=$(curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=doppler" | jq -r '.value // empty')
+          [ -n "$id" ] || { echo "::error::no GitHub OIDC token for this job"; exit 1; }
+          echo "::add-mask::$id"
+          token=$(jq -n --arg identity "$DOPPLER_IDENTITY" --arg token "$id" '{identity: $identity, token: $token}' |
+            curl -fsS -X POST -H 'Content-Type: application/json' --data @- https://api.doppler.com/v3/auth/oidc | jq -r '.token // empty')
+          [ -n "$token" ] || { echo "::error::Doppler refused this job's sign-in"; exit 1; }
+          echo "::add-mask::$token"
+          values="$RUNNER_TEMP/doppler.json"
+          trap 'rm -f "$values"' EXIT
+          curl -fsS -G -H "Authorization: Bearer $token" -H 'Accept: application/json' \
+            --data-urlencode project=owlwatch --data-urlencode config=release --data-urlencode format=json \
+            --data-urlencode "secrets=${SECRETS// /,}" https://api.doppler.com/v3/configs/config/secrets/download > "$values"
+          jq -r '.[] | strings | split("\n")[] | select(length > 0) | "::add-mask::" + .' "$values"
+          for name in $SECRETS; do
+            value=$(jq -r --arg name "$name" '.[$name] // empty' "$values")
+            [ -n "$value" ] || { echo "::error::Doppler owlwatch/release has no value for $name"; exit 1; }
+            delimiter="doppler_$(openssl rand -hex 16)"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter" >> "$GITHUB_OUTPUT"
+          done
+      - name: Import signing certificate
+        env:
+          MACOS_SIGN_P12: ${{ steps.doppler.outputs.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ steps.doppler.outputs.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ steps.doppler.outputs.MACOS_NOTARY_KEY }}
         run: |
           KEYCHAIN_PASSWORD=$(openssl rand -hex 32)
           echo "$MACOS_SIGN_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
@@ -85,10 +151,9 @@ jobs:
           security list-keychain -d user -s "$RUNNER_TEMP/build.keychain" $(security list-keychains -d user | tr -d '"')
           rm "$RUNNER_TEMP/certificate.p12"
       - name: Sign and notarize
-        if: env.RELEASE == 'true'
         env:
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ steps.doppler.outputs.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ steps.doppler.outputs.MACOS_NOTARY_ISSUER_ID }}
         run: |
           IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/build.keychain" \
             | sed -n 's/.*\([0-9A-F]\{40\}\) "Developer ID Application: .*/\1/p' | head -n 1)
@@ -102,7 +167,6 @@ jobs:
             --keychain "$RUNNER_TEMP/build.keychain" \
             dist/softnet
           codesign --verify --strict --verbose=2 dist/softnet
-          dist/softnet --version
 
           # A bare executable cannot be stapled; Gatekeeper finds the ticket online
           ditto -c -k dist/softnet "$RUNNER_TEMP/softnet-notarization.zip"
@@ -117,7 +181,6 @@ jobs:
           shasum -a 256 softnet.tar.gz dist/softnet | tee SHA256SUMS
           codesign --display --requirements - dist/softnet 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Publish
-        if: env.RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -126,7 +189,7 @@ jobs:
             --title "$VERSION" \
             --notes "Owlwatch build of Softnet $VERSION: arm64, signed and notarized by Owlwatch (Bright Shore Technologies). Upstream's source, unchanged."
       - name: Remove signing material
-        if: always() && env.RELEASE == 'true'
+        if: always()
         run: |
           security delete-keychain "$RUNNER_TEMP/build.keychain" || true
           rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/certificate.p12"
